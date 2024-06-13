@@ -1,0 +1,154 @@
+import openai
+import os
+import pandas as pd
+import numpy as np
+from nltk.tokenize import word_tokenize
+from dotenv import load_dotenv
+from openai.embeddings_utils import distances_from_embeddings
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Get the API key from the environment variables
+api_key = os.getenv("OPENAI_API_KEY")
+print(f"Loaded API Key: {api_key}")
+
+# Check if the API key is set
+if api_key is None:
+    raise ValueError("OPENAI_API_KEY environment variable not set. Please set it or include it in the script.")
+else:
+    openai.api_key = api_key
+
+# Function to clean up text by removing extra spaces and blank lines
+def clean_text(text):
+    lines = text.split('\n')
+    lines = [line.strip() for line in lines if line.strip()]
+    cleaned_text = ' '.join(lines)
+    return cleaned_text
+
+# Directory containing the text files
+text_directory = 'give your text file path location'
+
+# Verify the directory
+if not os.path.isdir(text_directory):
+    raise ValueError(f"Directory {text_directory} does not exist. Please check the path.")
+
+# List to hold the cleaned text from each file
+cleaned_texts = []
+
+# Loop through all text files in the directory
+for filename in os.listdir(text_directory):
+    if filename.endswith('.txt'):
+        file_path = os.path.join(text_directory, filename)
+        with open(file_path, 'r', encoding='utf-8') as file:
+            text = file.read()
+            #print(f"Original text from {filename}:\n{text}\n")  # Comment out this line
+            # Tokenize the text
+            tokenized_text = ' '.join(word_tokenize(text))
+            cleaned_text = clean_text(tokenized_text)
+            #print(f"Cleaned text from {filename}:\n{cleaned_text}\n")  # Comment out this line
+            cleaned_texts.append(cleaned_text)
+
+# Create a Pandas DataFrame from the list of cleaned texts
+df = pd.DataFrame(cleaned_texts, columns=['text'])
+
+# Ensure the DataFrame has the 'n_tokens' column
+df['n_tokens'] = df['text'].apply(lambda x: len(word_tokenize(x)))
+
+# Generate embeddings for each text and store in the DataFrame
+try:
+    df['embeddings'] = df['text'].apply(lambda x: openai.Embedding.create(input=x, engine='text-embedding-ada-002')['data'][0]['embedding'])
+except Exception as e:
+    print(f"Error generating embeddings: {e}")
+    raise
+
+# Write the DataFrame to a CSV file
+csv_file_path = 'processed/embeddings.csv'
+os.makedirs(os.path.dirname(csv_file_path), exist_ok=True)
+df.to_csv(csv_file_path, index=False)
+
+#print(f"CSV file has been created at {csv_file_path}")  # Comment out this line
+
+# Read the CSV file and process embeddings
+df = pd.read_csv('processed/embeddings.csv')
+df['embeddings'] = df['embeddings'].apply(eval).apply(np.array)
+
+def create_context(question, df, max_len=1800, size="ada"):
+    """
+    Create a context for a question by finding the most similar context from the dataframe.
+    """
+
+    # Get the embeddings for the question
+    q_embeddings = openai.Embedding.create(input=question, engine='text-embedding-ada-002')['data'][0]['embedding']
+
+    # Get the distances from the embeddings
+    df['distances'] = distances_from_embeddings(q_embeddings, df['embeddings'].values.tolist(), distance_metric='cosine')
+
+    returns = []
+    cur_len = 0
+
+    # Sort by distance and add the text to the context until the context is too long
+    for i, row in df.sort_values('distances', ascending=True).iterrows():
+        # Add the length of the text to the current length
+        cur_len += row['n_tokens'] + 4
+
+        # If the context is too long, break
+        if cur_len > max_len:
+            break
+
+        # Else add it to the text that is being returned
+        returns.append(row["text"])
+
+    # Return the context
+    return "\n\n###\n\n".join(returns)
+
+def answer_question(
+    df,
+    model="gpt-3.5-turbo",
+    question="Am I allowed to publish model outputs to Twitter, without a human review?",
+    max_len=1800,
+    size="ada",
+    debug=False,
+    max_tokens=150,
+    stop_sequence=None
+):
+    """
+    Answer a question based on the most similar context from the dataframe texts
+    """
+    context = create_context(
+        question,
+        df,
+        max_len=max_len,
+        size=size,
+    )
+    # If debug, print the raw model response
+    if debug:
+        print("Context:\n" + context)
+        print("\n\n")
+
+    try:
+        # Create a chat completion using the question and context
+        response = openai.ChatCompletion.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Answer the question based on the context below, and if the question can't be answered based on the context, say \"I don't know\"\n\n"},
+                {"role": "user", "content": f"Context: {context}\n\n---\n\nQuestion: {question}\nAnswer:"}
+            ],
+            temperature=0,
+            max_tokens=max_tokens,
+            top_p=1,
+            frequency_penalty=0,
+            presence_penalty=0,
+            stop=stop_sequence,
+        )
+        return response.choices[0].message['content'].strip()
+    except Exception as e:
+        print(e)
+        return ""
+
+# Example question
+question = input("Enter your question ?")
+
+# Answer the question
+answer = answer_question(df, question=question)
+print("Answer:", answer)
